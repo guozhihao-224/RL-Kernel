@@ -5,13 +5,25 @@
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from rl_engine.contracts.diagnostics.modules import module_debug_matrix
+from rl_engine.runtime.performance.schema import ExecutionPhase, OperatorWorkloadKey
+from rl_engine.runtime.semantic_registry import (
+    OperatorInstanceProvenance,
+    OperatorInstantiationError,
+    OperatorRequirements,
+    _JsonRecord,
+)
+
+if TYPE_CHECKING:
+    from rl_engine.runtime.semantic_registry import OperatorSession
+    from rl_engine.runtime.selector.cache import CachedSelection
 
 
 class Implementation(str, Enum):
@@ -87,10 +99,91 @@ def operator_ablation_case(module: str, case_id: str) -> OperatorAblationCase:
 
 
 @dataclass(frozen=True)
+class BoundOperatorSelection(_JsonRecord):
+    """An exact operator selection portable across framework worker processes."""
+
+    module: str
+    workload: OperatorWorkloadKey
+    requirements: OperatorRequirements
+    backend_id: str
+    descriptor_fingerprint: str
+    implementation_fingerprint: str | None
+    selection_reason: str
+    cache_reason: str
+
+    def __post_init__(self) -> None:
+        module = self.module.strip().lower()
+        if module not in {"attention", "ffn", "logp", "moe", "speculative"}:
+            raise ValueError(f"unsupported bound selection module {self.module!r}")
+        object.__setattr__(self, "module", module)
+
+    @property
+    def target(self) -> str:
+        return "training" if self.workload.phase is ExecutionPhase.TRAIN else "rollout"
+
+    @classmethod
+    def from_cached(cls, module: str, selection: CachedSelection) -> BoundOperatorSelection:
+        decision = selection.decision
+        return cls(
+            module=module,
+            workload=replace(decision.workload, shape=selection.requested_shape),
+            requirements=decision.resolution.requirements,
+            backend_id=decision.selected_backend_id,
+            descriptor_fingerprint=decision.resolution.descriptor.descriptor_fingerprint,
+            implementation_fingerprint=decision.implementation_fingerprint,
+            selection_reason=decision.reason,
+            cache_reason=selection.cache_reason,
+        )
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> BoundOperatorSelection:
+        data = dict(payload)
+        data["workload"] = OperatorWorkloadKey.from_dict(data["workload"])
+        data["requirements"] = OperatorRequirements(**data["requirements"])
+        return cls(**data)
+
+    def matches_provenance(self, value: Any) -> bool:
+        if not isinstance(value, Mapping):
+            return False
+        if value.get("backend_id") == self.backend_id and "descriptor_fingerprint" in value:
+            return value["descriptor_fingerprint"] == self.descriptor_fingerprint and (
+                self.implementation_fingerprint is None
+                or value.get("implementation_fingerprint") == self.implementation_fingerprint
+            )
+        return any(self.matches_provenance(item) for item in value.values())
+
+    def instantiate(
+        self,
+        session: OperatorSession,
+        *,
+        factory_kwargs: Mapping[str, Any] | None = None,
+    ) -> tuple[Any, OperatorInstanceProvenance]:
+        resolution = session.resolve(
+            semantic_op=self.workload.semantic_op,
+            requested_backend=self.backend_id,
+            target=self.target,
+            requirements=self.requirements,
+            strict=True,
+        )
+        if resolution.descriptor.descriptor_fingerprint != self.descriptor_fingerprint:
+            raise OperatorInstantiationError(f"bound operator {self.backend_id!r} changed")
+        instance = session.instantiate(resolution, factory_kwargs=factory_kwargs)
+        provenance = session.instance_provenance(resolution, instance)
+        if self.implementation_fingerprint is not None and (
+            provenance.implementation_fingerprint != self.implementation_fingerprint
+        ):
+            raise OperatorInstantiationError(
+                f"implementation of bound operator {self.backend_id!r} changed"
+            )
+        return instance, provenance
+
+
+@dataclass(frozen=True)
 class IntegrationPlan:
     """One independently selectable P/R case for Attention, FFN, and Logp."""
 
     cases: Mapping[str, OperatorAblationCase]
+    bound_selections: tuple[BoundOperatorSelection, ...] = ()
 
     def __post_init__(self) -> None:
         normalized = dict(self.cases)
@@ -100,6 +193,13 @@ class IntegrationPlan:
             if not isinstance(case, OperatorAblationCase) or case.module != module:
                 raise ValueError(f"invalid integration case for {module!r}")
         object.__setattr__(self, "cases", MappingProxyType(normalized))
+        bindings = tuple(self.bound_selections)
+        if len({(item.module, item.target) for item in bindings}) != len(bindings):
+            raise ValueError("operator selections must be unique per module and framework side")
+        object.__setattr__(self, "bound_selections", bindings)
+
+    def with_bound_selections(self, *selections: BoundOperatorSelection) -> "IntegrationPlan":
+        return IntegrationPlan(self.cases, self.bound_selections + tuple(selections))
 
     @classmethod
     def from_case_ids(
@@ -117,29 +217,52 @@ class IntegrationPlan:
             }
         )
 
+    def binding_for(self, module: str, target: str) -> BoundOperatorSelection | None:
+        return next(
+            (
+                item
+                for item in self.bound_selections
+                if item.module == module and item.target == target
+            ),
+            None,
+        )
+
     def implementation_for(self, module: str, target: str) -> Implementation:
+        module = module.strip().lower()
+        target = target.strip().lower()
+        if self.binding_for(module, target) is not None:
+            return Implementation.RL_KERNEL
         try:
-            case = self.cases[module.strip().lower()]
+            case = self.cases[module]
         except KeyError as exc:
             raise ValueError(f"unknown integration module {module!r}") from exc
         return case.implementation_for(target)
 
     def to_dict(self) -> dict[str, Any]:
         matrix = module_debug_matrix()
-        return {
+        result: dict[str, Any] = {
             "schema_version": matrix["schema_version"],
             "cases": {module: case.to_dict() for module, case in self.cases.items()},
         }
+        if self.bound_selections:
+            result["bound_selections"] = [item.to_dict() for item in self.bound_selections]
+        return result
 
 
 def integration_plan_from_environment() -> IntegrationPlan:
     """Materialize the one plan inherited by framework worker processes."""
 
-    return IntegrationPlan.from_case_ids(
+    plan = IntegrationPlan.from_case_ids(
         attention=os.getenv("RL_KERNEL_ATTENTION_CASE", "P/P"),
         ffn=os.getenv("RL_KERNEL_FFN_CASE", "P/P"),
         logp=os.getenv("RL_KERNEL_LOGP_CASE", "P/P"),
     )
+    bindings = json.loads(os.environ.get("RL_KERNEL_OPERATOR_BINDINGS", "[]"))
+    if bindings:
+        plan = plan.with_bound_selections(
+            *(BoundOperatorSelection.from_dict(item) for item in bindings)
+        )
+    return plan
 
 
 def configure_integration_environment(
@@ -155,11 +278,18 @@ def configure_integration_environment(
         ("logp", "RL_KERNEL_LOGP_CASE"),
     ):
         os.environ[variable] = plan.cases[module].case_id
+    if plan.bound_selections:
+        os.environ["RL_KERNEL_OPERATOR_BINDINGS"] = json.dumps(
+            [binding.to_dict() for binding in plan.bound_selections]
+        )
+    else:
+        os.environ.pop("RL_KERNEL_OPERATOR_BINDINGS", None)
     if readback_dir:
         os.environ["RL_KERNEL_READBACK_DIR"] = readback_dir
 
 
 __all__ = [
+    "BoundOperatorSelection",
     "Implementation",
     "IntegrationPlan",
     "OperatorAblationCase",

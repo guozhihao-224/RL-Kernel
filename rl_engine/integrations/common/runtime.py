@@ -53,6 +53,9 @@ class FrameworkOperatorIntegration:
         self.target = target
         self.plan = plan
         self._rl_kernel_operators = dict(rl_kernel_operators)
+        self._bindings = {
+            binding.module: binding for binding in plan.bound_selections if binding.target == target
+        }
         self._counts: Counter[str] = Counter()
         self._profile_counts: Counter[str] = Counter()
         self._readbacks: dict[str, OperatorReadback] = {}
@@ -66,8 +69,7 @@ class FrameworkOperatorIntegration:
 
     def install_operator(self, module: str, operator: Callable[..., Any]) -> None:
         normalized = module.strip().lower()
-        if normalized not in self.plan.cases:
-            raise ValueError(f"unknown integration module {module!r}")
+        self.plan.implementation_for(normalized, self.target)
         if not callable(operator):
             raise TypeError("operator must be callable")
         with self._lock:
@@ -75,8 +77,7 @@ class FrameworkOperatorIntegration:
 
     def record_installed_hook(self, module: str, hook_id: str) -> None:
         normalized = module.strip().lower()
-        if normalized not in self.plan.cases:
-            raise ValueError(f"unknown integration module {module!r}")
+        self.plan.implementation_for(normalized, self.target)
         if not isinstance(hook_id, str) or not hook_id.strip():
             raise ValueError("hook_id must be a non-empty string")
         with self._lock:
@@ -85,8 +86,7 @@ class FrameworkOperatorIntegration:
 
     def record_fallback(self, module: str, reason: str) -> None:
         normalized = module.strip().lower()
-        if normalized not in self.plan.cases:
-            raise ValueError(f"unknown integration module {module!r}")
+        self.plan.implementation_for(normalized, self.target)
         with self._lock:
             self._fallbacks.append({"module": normalized, "reason": str(reason)})
         self._persist_readback()
@@ -113,6 +113,9 @@ class FrameworkOperatorIntegration:
                     "but no operator was installed"
                 )
             selected = rl_kernel_operator
+        bound = self._bindings.get(normalized)
+        if bound is not None and getattr(selected, "backend_id", None) != bound.backend_id:
+            raise RuntimeError(f"{normalized} must use bound backend {bound.backend_id!r}")
         result = selected(*args, **kwargs)
         # vLLM's model forward is captured with a Dynamo fullgraph. Readback
         # bookkeeping performs Python locking and JSON I/O, so defer it until
@@ -140,8 +143,7 @@ class FrameworkOperatorIntegration:
         """Record framework shape/profile work without treating it as execution."""
 
         normalized = module.strip().lower()
-        if normalized not in self.plan.cases:
-            raise ValueError(f"unknown integration module {module!r}")
+        self.plan.implementation_for(normalized, self.target)
         with self._lock:
             self._profile_counts[normalized] += 1
             first_call = self._profile_counts[normalized] == 1
@@ -183,6 +185,16 @@ class FrameworkOperatorIntegration:
             provenance = dict(execution_provenance)
         actual_backend = _actual_backend(provenance) or backend_id
         fallback = _contains_fallback(provenance)
+        bound = self._bindings.get(normalized)
+        if bound is not None and (
+            fallback
+            or actual_backend != bound.backend_id
+            or not bound.matches_provenance(provenance)
+        ):
+            raise RuntimeError(
+                f"{normalized} execution differs from bound backend {bound.backend_id!r} "
+                f"or its recorded implementation"
+            )
         should_report = False
         route_changed = False
         route_fingerprint = (
@@ -194,12 +206,12 @@ class FrameworkOperatorIntegration:
         )
         with self._lock:
             self._counts[normalized] += 1
-            case = self.plan.cases[normalized]
+            case = self.plan.cases.get(normalized)
             self._readbacks[normalized] = OperatorReadback(
                 framework=self.framework,
                 target=self.target,
                 module=normalized,
-                case_id=case.case_id,
+                case_id="bound" if bound is not None else case.case_id,
                 implementation=implementation.value,
                 backend_id=backend_id,
                 call_count=self._counts[normalized],
@@ -249,7 +261,7 @@ class FrameworkOperatorIntegration:
         missing_hooks: list[str] = []
         missing_calls: list[str] = []
         wrong_backends: list[str] = []
-        for module in self.plan.cases:
+        for module in dict.fromkeys((*self.plan.cases, *self._bindings)):
             selected = self.plan.implementation_for(module, self.target)
             if selected is not Implementation.RL_KERNEL:
                 continue
@@ -258,6 +270,10 @@ class FrameworkOperatorIntegration:
             operator = payload["operators"].get(module)
             if operator is None or int(operator["call_count"]) <= 0:
                 missing_calls.append(module)
+            elif module in self._bindings:
+                binding = self._bindings[module]
+                if not binding.matches_provenance(operator["provenance"]):
+                    wrong_backends.append(f"{module}={operator['backend_id']}")
             elif not str(operator["backend_id"]).startswith(
                 ("rlkernel.", "pytorch-vocab-parallel-logp")
             ):
