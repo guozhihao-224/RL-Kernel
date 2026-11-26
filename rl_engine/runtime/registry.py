@@ -229,6 +229,14 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
             },
             determinism_or_alignment_properties={
                 "algorithm": "pytorch.log_softmax_gather",
+                "numerical_contract_id": "pytorch.log_softmax_gather",
+                "validated_workloads": {
+                    "cpu": {
+                        "phases": ("prefill", "train"),
+                        "layouts": ("row_major",),
+                        "shapes": "*",
+                    },
+                },
                 "batch_invariant": True,
                 "deterministic": True,
                 "strict_observable": True,
