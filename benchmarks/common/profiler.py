@@ -21,6 +21,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from rl_engine.platforms.device import device_ctx  # noqa: E402
+from rl_engine.runtime.performance import OperatorPerformanceRecord, OperatorWorkloadKey  # noqa: E402
+from rl_engine.runtime.semantic_registry import OperatorInstanceProvenance  # noqa: E402
 from rl_engine.utils.logger import logger  # noqa: E402
 from rl_engine.validation.common import selected_logprobs_reference  # noqa: E402
 
@@ -171,8 +173,8 @@ class PerformanceProfiler:
         self._metrics: list[BenchmarkMetrics] = []
 
     def _sync(self) -> None:
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        if self.device.type in {"cuda", "npu", "musa"}:
+            getattr(torch, self.device.type).synchronize(self.device)
 
     def _reset_memory(self) -> None:
         if self.device.type == "cuda":
@@ -184,7 +186,9 @@ class PerformanceProfiler:
             return 0.0
         return torch.cuda.max_memory_allocated(self.device) / (1024**3)
 
-    def _time_kernel(self, fn) -> tuple[Any, float, float | None]:
+    def _time_kernel(
+        self, fn, *, wall_times: list[float] | None = None
+    ) -> tuple[Any, float, float | None]:
         """Run fn with warmup + repeat, return (last_result, median_ms, std_ms)."""
         result = None
         for _ in range(max(0, self.warmup)):
@@ -197,21 +201,68 @@ class PerformanceProfiler:
             if self.device.type == "cuda":
                 start = torch.cuda.Event(enable_timing=True)
                 end = torch.cuda.Event(enable_timing=True)
+                t0 = time.perf_counter()
                 start.record()
                 result = fn()
                 end.record()
                 end.synchronize()
+                wall_ms = (time.perf_counter() - t0) * 1000.0
                 elapsed.append(start.elapsed_time(end))
             else:
                 t0 = time.perf_counter()
                 result = fn()
                 self._sync()
-                elapsed.append((time.perf_counter() - t0) * 1000.0)
+                wall_ms = (time.perf_counter() - t0) * 1000.0
+                elapsed.append(wall_ms)
+            if wall_times is not None:
+                wall_times.append(wall_ms)
 
         self._sync()
         median_ms = statistics.median(elapsed)
         std_ms = statistics.stdev(elapsed) if len(elapsed) > 1 else None
         return result, median_ms, std_ms
+
+    def measure_operator_record(
+        self,
+        fn: Callable[[], Any],
+        *,
+        workload: OperatorWorkloadKey,
+        provenance: OperatorInstanceProvenance,
+        peak_workspace_bytes: int | None = None,
+    ) -> OperatorPerformanceRecord:
+        """Measure one exact operator variant, including layout work performed by fn."""
+
+        platform = "rocm" if self.device.type == "cuda" and torch.version.hip else self.device.type
+        target = "training" if workload.phase.value == "train" else "rollout"
+        if platform not in {"cpu", "cuda", "rocm", "npu", "musa"}:
+            raise ValueError(f"operator measurement has no synchronization for {platform}")
+        if (workload.semantic_op, target, workload.device_type) != (
+            provenance.semantic_op,
+            provenance.target,
+            platform,
+        ):
+            raise ValueError("workload, profiler device, and operator provenance must agree")
+        if self.warmup < 1:
+            raise ValueError("operator measurements require a warmup")
+
+        wall_times: list[float] = []
+        _, kernel_ms, _ = self._time_kernel(fn, wall_times=wall_times)
+        allocated = (
+            torch.cuda.max_memory_allocated(self.device) if self.device.type == "cuda" else None
+        )
+        return OperatorPerformanceRecord(
+            workload=workload,
+            backend_id=provenance.backend_id,
+            descriptor_fingerprint=provenance.descriptor_fingerprint,
+            implementation_fingerprint=provenance.implementation_fingerprint,
+            warmup_iterations=self.warmup,
+            measured_iterations=len(wall_times),
+            synchronized=True,
+            kernel_latency_ms=kernel_ms,
+            peak_workspace_bytes=peak_workspace_bytes,
+            peak_allocated_bytes=allocated,
+            elapsed_latency_ms=statistics.median(wall_times),
+        )
 
     def _measure_peak_memory_once(self, fn) -> float:
         """Measure peak allocation for one invocation after the configured warmup."""
