@@ -1,102 +1,127 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
+"""Sampling dispatcher and multi-backend routing (#563 Task 49)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+
 import torch
 import torch.nn as nn
 
-from rl_engine.platforms.constants import constants
-from rl_engine.utils.logger import logger
+from rl_engine.ops.sampling.policy import (
+    GREEDY_TEMPERATURE,
+    SAMPLING_PROBABILITY_DEFINITION_ID,
+    SamplingPolicyConfig,
+    transformed_sampling_logprobs,
+    transformed_sampling_probs,
+)
+from rl_engine.runtime.semantic_registry import _JsonRecord
+
+
+@dataclass(frozen=True)
+class SamplingDispatchSelection(_JsonRecord):
+    """Traceable registration and selection record for a platform sampling backend."""
+
+    platform: str
+    backend_id: str
+    backend_lib: str
+    probability_definition_id: str = SAMPLING_PROBABILITY_DEFINITION_ID
+
+
+def _sampling_backend(device: str | torch.device | None):
+    from rl_engine.runtime.registry import kernel_registry
+
+    if isinstance(device, str) and device.split(":", 1)[0] == "ascend":
+        device = device.replace("ascend", "npu", 1)
+    op = kernel_registry.get_op("sampling", device)
+    selection = SamplingDispatchSelection(
+        kernel_registry._platform_for_device(device), op.backend_id, op.backend_lib
+    )
+    return op, selection
+
+
+def resolve_sampling_dispatch(
+    device_or_platform: str | torch.device | None = None,
+) -> SamplingDispatchSelection:
+    return _sampling_backend(device_or_platform)[1]
 
 
 class SamplerBackend(nn.Module):
-    def __init__(self):
+    def __init__(self, device: str | torch.device | None = None):
         super().__init__()
-        self.backend = self._detect_backend()
-        self._init_backend_assets()
+        self.dispatch_selection = resolve_sampling_dispatch(device)
+        self._platform = None if device is None else self.dispatch_selection.platform
 
-    def _detect_backend(self):
-        if torch.version.hip:
-            logger.info_once("Detected AMD GPU (ROCm) - Using AITER backend")
-            return constants.BackendLib.AITER.value
-        else:
-            logger.info_once("Detected NVIDIA GPU (CUDA) - Using FlashInfer backend")
-            return constants.BackendLib.FLASHINFER.value
-
-    def _init_backend_assets(self):
-        """
-        Preload backend-specific dependencies
-        to avoid runtime import overhead.
-        """
-        if self.backend == constants.BackendLib.FLASHINFER.value:
-            try:
-                import flashinfer
-
-                self.flashinfer = flashinfer
-                logger.info("FlashInfer kernels loaded successfully.")
-            except ImportError:
-                logger.error("FlashInfer not found. Please install it for NVIDIA GPUs.")
-        elif self.backend == constants.BackendLib.AITER.value:
-            pass
+    @property
+    def backend(self) -> str:
+        return self.dispatch_selection.backend_lib
 
     @torch.inference_mode()
-    def sample(self, logits, top_k=None, top_p=None, temperature=1.0, deterministic=True):
-        """
-        Unified sampling interface.
-        """
-        logits = logits.contiguous()
-        if temperature != 1.0:
-            logits = logits / temperature
+    def sample(
+        self,
+        logits,
+        top_k=None,
+        top_p=None,
+        temperature=1.0,
+        deterministic=True,
+        *,
+        policy: SamplingPolicyConfig | None = None,
+        generator: torch.Generator | None = None,
+        rng_seed: int | None = None,
+    ):
+        op, selection = _sampling_backend(logits.device)
+        if self._platform is not None and self._platform != selection.platform:
+            raise ValueError(
+                f"configured sampling platform {self._platform!r} does not match logits"
+            )
+        seed = policy.rng_seed if rng_seed is None and policy is not None else rng_seed
+        if generator is None and seed is not None:
+            generator = torch.Generator(device=logits.device).manual_seed(seed)
 
-        if self.backend == constants.BackendLib.FLASHINFER.value:
-            from flashinfer.sampling import top_k_renorm_probs, top_p_sampling_from_probs
-
-            logits = logits.float().contiguous()
-            probs = torch.softmax(logits, dim=-1)
-
-            if top_k is None and top_p is None:
-                return torch.multinomial(probs, num_samples=1).view(-1)
-
-            if top_k is not None:
-                probs = top_k_renorm_probs(probs, top_k)
-
-            if top_p is not None:
-                return top_p_sampling_from_probs(probs, top_p, deterministic=deterministic)
-
-            return torch.multinomial(probs, num_samples=1).view(-1)
-
-        elif self.backend == constants.BackendLib.AITER.value:
-            # TODO: Connect to AITER's sampling operator
-            # return aiter.ops.sample(logits, ...)
-            pass
-
-        # Fallback to native PyTorch sampling
-        if top_k is not None:
-            topk_values, _ = torch.topk(logits, top_k)
-            min_topk = topk_values[..., -1, None]
-            logits = torch.where(logits < min_topk, torch.full_like(logits, float("-inf")), logits)
-        probs = torch.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+        legacy = getattr(op, "sample_legacy", None)
+        if (
+            policy is None
+            and legacy is not None
+            and isinstance(temperature, (int, float))
+            and temperature >= GREEDY_TEMPERATURE
+        ):
+            self.dispatch_selection = replace(
+                selection, probability_definition_id=op.legacy_probability_definition_id
+            )
+            return legacy(
+                logits,
+                temperature,
+                top_k,
+                top_p,
+                generator=generator,
+                deterministic=deterministic,
+            )
+        self.dispatch_selection = selection
+        policy = policy or SamplingPolicyConfig(temperature=temperature, top_k=top_k, top_p=top_p)
+        probs, _ = transformed_sampling_probs(logits, policy)
+        return op.sample(probs, generator=generator, deterministic=deterministic)
 
     @torch.inference_mode()
-    def compute_logp(self, logits, token_ids):
-        """
-        Pre-allocated block logic for computing log probabilities of selected tokens.
-        """
+    def compute_logp(self, logits, token_ids, *, policy: SamplingPolicyConfig | None = None):
+        if policy is not None:
+            return transformed_sampling_logprobs(logits, token_ids, policy)
         batch_size = logits.shape[0]
-        out_logp = torch.empty(
-            logits.shape[0], logits.shape[1], device=logits.device, dtype=logits.dtype
-        )
-
-        chunk_size = 4096  # Tune this based on GPU memory and performance characteristics
-
-        for i in range(0, batch_size, chunk_size):
-            c_logits = logits[i : i + chunk_size]
-            c_token_ids = token_ids[i : i + chunk_size]
-
-            out_logp[i : i + chunk_size] = (
+        out_logp = logits.new_empty(logits.shape[:-1])
+        for i in range(0, batch_size, 4096):
+            c_logits = logits[i : i + 4096]
+            c_token_ids = token_ids[i : i + 4096]
+            out_logp[i : i + 4096] = (
                 torch.log_softmax(c_logits, dim=-1)
                 .gather(-1, c_token_ids.unsqueeze(-1))
                 .squeeze(-1)
             )
+        return out_logp
 
-        return out_logp.view(batch_size, -1)
+
+__all__ = [
+    "SamplerBackend",
+    "SamplingDispatchSelection",
+    "resolve_sampling_dispatch",
+]

@@ -4,76 +4,63 @@
 import sys
 import types
 
+import pytest
 import torch
 
-from rl_engine.platforms.constants import constants
+from rl_engine.ops.sampling.api import SamplerBackend
+from rl_engine.ops.sampling.policy import (
+    SAMPLING_PROBABILITY_DEFINITION_ID,
+    SamplingPolicyConfig,
+    sampling_keep_mask,
+)
+from rl_engine.runtime import registry
 
 
-def _install_fake_flashinfer(monkeypatch, capture):
-    """Inject a stub ``flashinfer.sampling`` so the FlashInfer code path runs on CPU.
+@pytest.mark.parametrize("temperature", [1.0, 2.0])
+def test_flashinfer_dispatch_preserves_legacy_and_explicit_policy(monkeypatch, temperature):
+    captured = {}
+    sampling = types.ModuleType("flashinfer.sampling")
 
-    ``top_p_sampling_from_probs`` records the probabilities it receives so the test
-    can assert how temperature was applied before sampling.
-    """
-    fi = types.ModuleType("flashinfer")
-    fi_sampling = types.ModuleType("flashinfer.sampling")
+    def sample(probs, *, generator, deterministic):
+        captured.update(probs=probs.clone(), generator=generator)
+        return torch.multinomial(probs, 1, generator=generator).squeeze(1)
 
-    def top_k_renorm_probs(probs, top_k):
-        return probs
+    def top_p_sample(probs, top_p, **kwargs):
+        captured["top_p"] = top_p
+        return sample(probs, **kwargs)
 
-    def top_p_sampling_from_probs(probs, top_p, deterministic=True):
-        capture["probs"] = probs.clone()
-        return torch.zeros(probs.shape[0], dtype=torch.long)
+    sampling.sampling_from_probs = sample
+    sampling.top_p_sampling_from_probs = top_p_sample
+    sampling.top_k_renorm_probs = lambda probs, top_k: probs
+    monkeypatch.setitem(sys.modules, "flashinfer.sampling", sampling)
+    monkeypatch.setattr(
+        registry.KernelRegistry, "_platform_for_device", lambda self, device: "cuda"
+    )
+    monkeypatch.setattr(registry, "kernel_registry", registry.KernelRegistry())
 
-    fi_sampling.top_k_renorm_probs = top_k_renorm_probs
-    fi_sampling.top_p_sampling_from_probs = top_p_sampling_from_probs
-    fi.sampling = fi_sampling
+    logits = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 4
+    generator = torch.Generator().manual_seed(7)
+    sampler = SamplerBackend(device="cuda")
+    top_p = torch.tensor([0.9, 0.8])
 
-    monkeypatch.setitem(sys.modules, "flashinfer", fi)
-    monkeypatch.setitem(sys.modules, "flashinfer.sampling", fi_sampling)
+    def no_scalar_read(self):
+        pytest.fail("legacy filtering must keep per-row parameters on the device")
 
+    with monkeypatch.context() as context:
+        context.setattr(torch.Tensor, "item", no_scalar_read)
+        sampler.sample(logits, top_p=top_p, temperature=temperature, generator=generator)
+    torch.testing.assert_close(captured.pop("top_p"), top_p)
+    torch.testing.assert_close(captured["probs"], (logits / temperature).softmax(-1))
+    assert sampler.dispatch_selection.probability_definition_id.endswith("flashinfer_legacy.v1")
 
-def test_flashinfer_temperature_applied_once(monkeypatch):
-    """Regression: the FlashInfer path must scale logits by 1/T exactly once.
-
-    Previously temperature was divided once for all backends and a second time
-    inside the FlashInfer branch, yielding softmax(logits / T**2).
-    """
-    capture = {}
-    _install_fake_flashinfer(monkeypatch, capture)
-
-    from rl_engine.ops.sampling.api import SamplerBackend
-
-    sampler = SamplerBackend()
-    # Force the FlashInfer path regardless of the detected hardware.
-    sampler.backend = constants.BackendLib.FLASHINFER.value
-
-    torch.manual_seed(0)
-    logits = torch.randn(4, 16)
-    temperature = 2.0
-
-    sampler.sample(logits, top_p=0.9, temperature=temperature)
-
-    expected = torch.softmax(logits.float() / temperature, dim=-1)
-    assert torch.allclose(
-        capture["probs"], expected, atol=1e-6
-    ), "FlashInfer path must apply temperature exactly once (got T**2 scaling)"
-
-
-def test_flashinfer_temperature_one_is_unchanged(monkeypatch):
-    """temperature == 1.0 must leave logits unscaled (both divisions are skipped)."""
-    capture = {}
-    _install_fake_flashinfer(monkeypatch, capture)
-
-    from rl_engine.ops.sampling.api import SamplerBackend
-
-    sampler = SamplerBackend()
-    sampler.backend = constants.BackendLib.FLASHINFER.value
-
-    torch.manual_seed(0)
-    logits = torch.randn(4, 16)
-
-    sampler.sample(logits, top_p=0.9, temperature=1.0)
-
-    expected = torch.softmax(logits.float(), dim=-1)
-    assert torch.allclose(capture["probs"], expected, atol=1e-6)
+    policy = SamplingPolicyConfig(top_p=0.9, temperature=temperature)
+    sampler.sample(logits, policy=policy, generator=generator)
+    keep = sampling_keep_mask(logits, temperature=temperature, top_p=0.9)
+    torch.testing.assert_close(
+        captured["probs"], (logits / temperature).masked_fill(~keep, -torch.inf).softmax(-1)
+    )
+    assert captured["generator"] is generator
+    assert "top_p" not in captured
+    assert (
+        sampler.dispatch_selection.probability_definition_id == SAMPLING_PROBABILITY_DEFINITION_ID
+    )

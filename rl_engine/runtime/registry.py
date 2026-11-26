@@ -105,6 +105,11 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     TRITON_RATIO_KL = "rl_engine.kernels.ops.triton.loss.ratio_kl.TritonRatioKLOp"
     PYTORCH_RATIO_KL = "rl_engine.kernels.ops.pytorch.loss.ratio_kl.NativeRatioKLOp"
 
+    # Token sampling from the shared policy probabilities.
+    CUDA_FLASHINFER_SAMPLING = "rl_engine.backends.cuda.sampling.sampling.FlashInferSamplingOp"
+    ASCEND_SAMPLING = "rl_engine.backends.ascend.sampling.AscendSamplingOp"
+    PYTORCH_SAMPLING = "rl_engine.backends.cpu.sampling.PyTorchSamplingOp"
+
     # Variable-length packing (pack-and-pad), [B,S,...] -> [Total_Active,...]
     PYTORCH_PACK = "rl_engine.kernels.ops.pytorch.packing.pack.NativePackOp"
     # Batch-invariant deterministic GEMM (WS1 #146)
@@ -802,6 +807,11 @@ class KernelRegistry:
         self._priority_map["npu"]["det_gemm"] = [
             OpBackend.ASCEND_DET_GEMM,
         ]
+        for priorities in self._priority_map.values():
+            priorities["sampling"] = [OpBackend.PYTORCH_SAMPLING]
+        self._priority_map["cuda"]["sampling"].insert(0, OpBackend.CUDA_FLASHINFER_SAMPLING)
+        self._priority_map["npu"]["sampling"].insert(0, OpBackend.ASCEND_SAMPLING)
+
         logger.info(f"KernelRegistry initialized for {device_ctx.device_type}")
         self._adjust_priority_for_hardware()
         self._adjust_priority_from_env()
@@ -1067,6 +1077,10 @@ class KernelRegistry:
     def _platform_for_device(self, device: torch.device | str | None) -> str:
         if device is None:
             return self._platform()
+        if isinstance(device, str):
+            platform = device.split(":", 1)[0]
+            if platform in {"rocm", "npu", "musa"}:
+                return platform
         resolved = torch.device(device)
         if resolved.type == "cuda":
             return "rocm" if torch.version.hip is not None else "cuda"
